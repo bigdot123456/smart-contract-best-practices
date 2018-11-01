@@ -101,7 +101,7 @@ contract auction {
     function bid() payable {
         require(msg.value >= highestBid);
 
-        if (highestBidder != 0) {
+        if (highestBidder != address(0)) {
             highestBidder.transfer(highestBid); // if this call consistently fails, no one else can bid
         }
 
@@ -119,7 +119,7 @@ contract auction {
     function bid() payable external {
         require(msg.value >= highestBid);
 
-        if (highestBidder != 0) {
+        if (highestBidder != address(0)) {
             refunds[highestBidder] += highestBid; // record the refund that this user can claim
         }
 
@@ -134,6 +134,31 @@ contract auction {
     }
 }
 ```
+
+### Don't delegatecall to untrusted code
+
+The `delegatecall` function is used to call functions from other contracts as if they belong to the caller contract. Thus the callee may change the state of the calling address. This may be insecure. An example below shows how using `delegatecall` can lead to the destruction of the contract and loss of its balance.
+
+```sol
+contract Destructor
+{
+    function doWork() external
+    {
+        selfdestruct(0);
+    }
+}
+
+contract Worker
+{
+    function doWork(address _internalWorker) public
+    {
+        // unsafe
+        _internalWorker.delegatecall(bytes4(keccak256("doWork()")));
+    }
+}
+```
+
+If `Worker.doWork()` is called with the address of the deployed `Destructor` contract as an argument, the `Worker` contract will self-destruct. Delegate execution only to trusted contracts, and never to a user supplied address.
 
 ## Don't assume contracts are created with zero balance
 
@@ -186,6 +211,37 @@ Note that the assertion is *not* a strict equality of the balance because the co
 
 In Solidity 0.4.10 `assert()` and `require()` were introduced. `require(condition)` is meant to be used for input validation, which should be done on any user input, and reverts if the condition is false. `assert(condition)` also reverts if the condition is false but should be used only for invariants: internal errors or to check if your contract has reached an invalid state. Following this paradigm allows formal analysis tools to verify that the invalid opcode can never be reached: meaning no invariants in the code are violated and that the code is formally verified.
 
+## Use modifiers only for assertions
+
+The code inside a modifier is usually executed before the function body, so any state changes or external calls will violate the [Checks-Effects-Interactions](https://solidity.readthedocs.io/en/develop/security-considerations.html#use-the-checks-effects-interactions-pattern) pattern. Moreover, these statements may also remain unnoticed by the developer, as the code for modifier may be far from the function declaration. For example, an external call in modifier can lead to the reentrancy attack:
+
+```sol
+contract Registry {
+    address owner;
+    
+    function isVoter(address _addr) external returns(bool) {
+        // Code
+    }
+}
+
+contract Election {
+    Registry registry;
+    
+    modifier isEligible(address _addr) {
+        require(registry.isVoter(_addr));
+        _;
+    }
+    
+    function vote() isEligible(msg.sender) public {
+        // Code
+    }
+}
+```
+
+In this case, the `Registry` contract can make a reentracy attack by calling `Election.vote()` inside `isVoter()`.
+
+Use modifiers only for [error handling](https://solidity.readthedocs.io/en/develop/control-structures.html#error-handling-assert-require-revert-and-exceptions).
+
 ## Beware rounding with integer division
 
 All integer division rounds down to the nearest integer. If you need more precision, consider using a multiplier, or store both the numerator and denominator.
@@ -228,7 +284,7 @@ Both interfaces and abstract contracts provide one with a customizable and re-us
 
 ## Keep fallback functions simple
 
-[Fallback functions](http://solidity.readthedocs.io/en/latest/contracts.html#fallback-function) are called when a contract is sent a message with no arguments (or when no function matches), and only has access to 2,300 gas when called from a `.send()` or `.transfer()`. If you wish to be able to receive Ether from a `.send()` or `.transfer()`, the most you can do in a fallback function is log an event. Use a proper function if a computation or more gas is required.
+[Fallback functions](http://solidity.readthedocs.io/en/latest/contracts.html#fallback-function) are called when a contract is sent a message with no arguments (or when no function matches), and only has access to 2,300 gas when called from a `.send()` or `.transfer()`. If you wish to be able to receive Ether from a `.send()` or `.transfer()`, the most you can do in a fallback function is log an event. Use a proper function if a computation of more gas is required.
 
 ```sol
 // bad
@@ -293,21 +349,58 @@ pragma solidity 0.4.4;
 
 ### Exception
 
-Pragma statements can be allowed to float when a contract is intended for consumption by other developers, as in the case with contracts in a library or EthPM package. Otherwise, the developer would need to manually update the pragma in order to compile locally. 
+Pragma statements can be allowed to float when a contract is intended for consumption by other developers, as in the case with contracts in a library or EthPM package. Otherwise, the developer would need to manually update the pragma in order to compile locally.
 
-## Differentiate functions and events
+## Use events to monitor contract activity
 
-Favor capitalization and a prefix in front of events (we suggest *Log*), to prevent the risk of confusion between functions and events. For functions, always start with a lowercase letter, except for the constructor.
+It can be useful to have a way to monitor the contract's activity after it was deployed. One way to accomplish this is to look at all transactions of the contract, however that may be insufficient, as message calls between contracts are not recorded in the blockchain. Moreover, it shows only the input parameters, not the actual changes being made to the state.
 
 ```sol
-// bad
-event Transfer() {}
-function transfer() {}
+contract Charity {
+    mapping(address => uint) balances;
+    
+    function donate() payable public {
+        balances[msg.sender] += msg.value;
+    }
+}
 
-// good
-event LogTransfer() {}
-function transfer() external {}
+contract Game {
+    function buyCoins() payable public {
+        // 5% goes to charity
+        charity.donate.value(msg.value / 20)();
+    }
+}
 ```
+
+Here, `Game` contract will make an internal call to `Charity.donate()`. This transaction won't appear in the transaction list of `Charity`. Even if we look at the `Game` transaction, we will only see the amount the player spent to buy coins, not the amount that went to the `Charity` contract.
+
+It is possible to fix both issues via events. An event is a convenient way to log something that happened in the contract. Events that were emitted stay in the blockchain along with the other contract data and they are available for future audit. Here is an improvement to the example above, using events to provide a history of the Charity's donations.
+
+```sol
+contract Charity {
+    // define event
+    event LogDonate(uint _amount);
+    
+    mapping(address => uint) balances;
+    
+    function donate() payable public {
+        balances[msg.sender] += msg.value;
+        // emit event
+        emit LogDonate(msg.value);
+    }
+}
+
+contract Game {
+    function buyCoins() payable public {
+        // 5% goes to charity
+        charity.donate.value(msg.value / 20)();
+    }
+}
+
+```
+
+Here, all transactions that go through the `Charity` contract, either directly or not, will show up in the event list of that contract along with the amount of donated money.
+
 
 ## Prefer newer Solidity constructs
 
@@ -382,7 +475,7 @@ It's also worth mentioning that by using `tx.origin` you're limiting interoperab
 
 There are three main considerations when using a timestamp to execute a critical function in a contract, especially when actions involve fund transfer.
 
-### Gameability
+### Timestamp Manipulation
 
 Be aware that the timestamp of the block can be manipulated by a miner. Consider this [contract](https://etherscan.io/address/0xcac337492149bdb66b088bf5914bedfbf78ccc18#code):
 
@@ -401,24 +494,19 @@ function random(uint Max) constant private returns (uint256 result){
 }
 ```
 
-When the contract uses the timestamp to seed a random number, the miner can actually post a timestamp within 30 seconds of the block being validating, effectively allowing the miner to precompute an option more favorable to their chances in the lottery. Timestamps are not random and should not be used in that context.
+When the contract uses the timestamp to seed a random number, the miner can actually post a timestamp within 15 seconds of the block being validated, effectively allowing the miner to precompute an option more favorable to their chances in the lottery. Timestamps are not random and should not be used in that context.
 
-### *30-second Rule*
-A general rule of thumb in evaluating timestamp usage is:
-#### If the contract function can tolerate a [30-second](https://ethereum.stackexchange.com/questions/5924/how-do-ethereum-mining-nodes-maintain-a-time-consistent-with-the-network/5931#5931) drift in time, it is safe to use `block.timestamp`
-If the scale of your time-dependent event can vary by 30-seconds and maintain integrity, it is safe to use a timestamp. This includes things like ending of auctions, registration periods, etc. 
+### The 15-second Rule
 
-### Caution using `block.number` as a timestamp
+The [Yellow Paper](http://yellowpaper.io/) (Ethereum's reference specification) does not specify a constraint on how much blocks can drift in time, but [it does specify](https://ethereum.stackexchange.com/a/5926/46821) that each timestamp should be bigger than the timestamp of its parent. Popular Ethereum protocol implementations [Geth](https://github.com/ethereum/go-ethereum/blob/4e474c74dc2ac1d26b339c32064d0bac98775e77/consensus/ethash/consensus.go#L45) and [Parity](https://github.com/paritytech/parity-ethereum/blob/73db5dda8c0109bb6bc1392624875078f973be14/ethcore/src/verification/verification.rs#L296-L307) both reject blocks with timestamp more than 15 seconds in future. Therefore, a good rule of thumb in evaluating timestamp usage is:
+> If the contract function can tolerate a 15-second drift in time, it is safe to use `block.timestamp`
 
-When a contract creates an `auction_complete` modifier to signify the end of a token sale such as [so]((https://github.com/SpankChain/old-sc_auction/blob/master/contracts/Auction.sol))
-```sol
-modifier auction_complete {
-    require(auctionEndBlock <= block.number     ||
-          currentAuctionState == AuctionState.success || 
-          currentAuctionState == AuctionState.cancel)
-        _;}
-```
-`block.number` and *[average block time](https://etherscan.io/chart/blocktime)* can be used to estimate time as well, but this is not future proof as block times may change (such as [fork reorganisations](https://blog.ethereum.org/2015/08/08/chain-reorganisation-depth-expectations/) and the [difficulty bomb](https://github.com/ethereum/EIPs/issues/649)). In a sale spanning days, the 12-minute rule allows one to construct a more reliable estimate of time. 
+If the scale of your time-dependent event can vary by 15 seconds and maintain integrity, it is safe to use a timestamp.
+
+### Avoid using `block.number` as a timestamp
+
+It is possible to estimate a time delta using the `block.number` property and [average block time](https://etherscan.io/chart/blocktime), however this is not future proof as block times may change (such as [fork reorganisations](https://blog.ethereum.org/2015/08/08/chain-reorganisation-depth-expectations/) and the [difficulty bomb](https://github.com/ethereum/EIPs/issues/649)). In a sale spanning days, the 15-second rule allows one to achieve a more reliable estimate of time.
+
 
 ## Multiple Inheritance Caution
 
@@ -459,15 +547,115 @@ contract A is B, C {
   }
 }
 ```
-When A is deployed, the compiler will *linearize* the inheritance from left to right, as:
+When a contract is deployed, the compiler will *linearize* the inheritance from right to left (after the keyword _is_ the parents are listed from the most base-like to the most derived). Here is contract A's linearization:
 
-**C -> B -> A**
+**Final <- B <- C <- A**
 
 The consequence of the linearization will yield a `fee` value of 5, since C is the most derived contract. This may seem obvious, but imagine scenarios where C is able to shadow crucial functions, reorder boolean clauses, and cause the developer to write exploitable contracts. Static analysis currently does not raise issue with overshadowed functions, so it must be manually inspected.
 
 For more on security and inheritance, check out this [article](https://pdaian.com/blog/solidity-anti-patterns-fun-with-inheritance-dag-abuse/)
 
 To help contribute, Solidity's Github has a [project](https://github.com/ethereum/solidity/projects/9#card-8027020) with all inheritance-related issues.
+
+## Use interface type instead of the address for type safety
+
+When a function takes a contract address as an argument, it is better to pass an interface or contract type rather than raw `address`. If the function is called elsewhere within the source code, the compiler it will provide additional type safety guarantees.
+
+Here we see two alternatives: 
+
+```sol
+contract Validator {
+    function validate(uint) external returns(bool);
+}
+
+contract TypeSafeAuction {
+    // good
+    function validateBet(Validator _validator, uint _value) internal returns(bool) {
+        bool valid = _validator.validate(_value);
+        return valid;
+    }
+}
+
+contract TypeUnsafeAuction {
+    // bad
+    function validateBet(address _addr, uint _value) internal returns(bool) {
+        Validator validator = Validator(_addr);
+        bool valid = validator.validate(_value);
+        return valid;
+    }
+}
+```
+
+The benefits of using the `TypeSafeAuction` contract above can then be seen from the following example. If `validateBet()` is called with an `address` argument, or a contract type other than `Validator`, the compiler will throw this error:
+
+```sol
+contract NonValidator{}
+
+contract Auction is TypeSafeAuction {
+    NonValidator nonValidator;
+  
+    function bet(uint _value) {
+        bool valid = validateBet(nonValidator, _value); // TypeError: Invalid type for argument in function call.
+                                                        // Invalid implicit conversion from contract NonValidator 
+                                                        // to contract Validator requested.
+    }
+}
+```
+
+## Avoid using `extcodesize` to check for Externally Owned Accounts
+
+The following modifier (or a similar check) is often used to verify whether a call was made from an externally owned account (EOA) or a contract account:
+
+```sol
+// bad
+modifier isNotContract(address _a) {
+  uint size;
+  assembly {
+    size := extcodesize(_a)
+  }
+    require(size == 0);
+     _;
+}
+```
+
+The idea is straight forward: if an address contains code, it's not an EOA but a contract account. However, a contract does not have source code available during construction. This means that while the constructor is running, it can make calls to other contracts, but `extcodesize` for its address returns zero. Below is a minimal example that shows how this check can be circumvented:
+
+```sol
+contract OnlyForEOA {    
+    uint public flag;
+    
+    // bad
+    modifier isNotContract(address _a){
+        uint len;
+        assembly { len := extcodesize(_a) }
+        require(len == 0);
+        _;
+    }
+    
+    function setFlag(uint i) public isNotContract(msg.sender){
+        flag = i;
+    }
+}
+
+contract FakeEOA {
+    constructor(address _a) public {
+        OnlyForEOA c = OnlyForEOA(_a);
+        c.setFlag(1);
+    }
+}
+```
+
+Because contract addresses can be pre-computed, this check could also fail if it checks an address which is empty at block `n`, but which has a contract deployed to it at some block greater than `n`. 
+
+!!! warning
+
+    This issue is nuanced. 
+
+    If your goal is to prevent other contracts from being able to call your contract, the `extcodesize` check is probably sufficient. An alternative approach is to check the value of `(tx.origin == msg.sender)`, though this also [has drawbacks](recommendations/#avoid-using-txorigin).
+
+    There may be other situations in which the `extcodesize` check serves your purpose. Describing all of them here is out of scope. Understand the underlying behaviors of the EVM and use your Judgement.
+
+    
 
 ## Deprecated/historical recommendations
 
@@ -476,3 +664,19 @@ These are recommendations which are no longer relevant due to changes in the pro
 ### Beware division by zero (Solidity < 0.4)
 
 Prior to version 0.4, Solidity [returns zero](https://github.com/ethereum/solidity/issues/670) and does not `throw` an exception when a number is divided by zero. Ensure you're running at least version 0.4.
+
+### Differentiate functions and events (Solidity < 0.4.21)
+
+In [v0.4.21](https://github.com/ethereum/solidity/blob/develop/Changelog.md#0421-2018-03-07) Solidity introduced the `emit` keyword to indicate an event `emit EventName();`. As of 0.5.0, it is required. 
+
+Favor capitalization and a prefix in front of events (we suggest *Log*), to prevent the risk of confusion between functions and events. For functions, always start with a lowercase letter, except for the constructor.
+
+```sol
+// bad
+event Transfer() {}
+function transfer() {}
+
+// good
+event LogTransfer() {}
+function transfer() external {}
+```

@@ -75,8 +75,8 @@ mapping (address => uint) private userBalances;
 mapping (address => bool) private claimedBonus;
 mapping (address => uint) private rewardsForA;
 
-function withdraw(address recipient) public {
-    uint amountToWithdraw = userBalances[recipient];
+function withdrawReward(address recipient) public {
+    uint amountToWithdraw = rewardsForA[recipient];
     rewardsForA[recipient] = 0;
     require(recipient.call.value(amountToWithdraw)());
 }
@@ -85,20 +85,20 @@ function getFirstWithdrawalBonus(address recipient) public {
     require(!claimedBonus[recipient]); // Each recipient should only be able to claim the bonus once
 
     rewardsForA[recipient] += 100;
-    withdraw(recipient); // At this point, the caller will be able to execute getFirstWithdrawalBonus again.
+    withdrawReward(recipient); // At this point, the caller will be able to execute getFirstWithdrawalBonus again.
     claimedBonus[recipient] = true;
 }
 ```
 
-Even though `getFirstWithdrawalBonus()` doesn't directly call an external contract, the call in `withdraw()` is enough to make it vulnerable to a race condition. You therefore need to treat `withdraw()` as if it were also untrusted.
+Even though `getFirstWithdrawalBonus()` doesn't directly call an external contract, the call in `withdrawReward()` is enough to make it vulnerable to a race condition. You therefore need to treat `withdrawReward()` as if it were also untrusted.
 
 ```sol
 mapping (address => uint) private userBalances;
 mapping (address => bool) private claimedBonus;
 mapping (address => uint) private rewardsForA;
 
-function untrustedWithdraw(address recipient) public {
-    uint amountToWithdraw = userBalances[recipient];
+function untrustedWithdrawReward(address recipient) public {
+    uint amountToWithdraw = rewardsForA[recipient];
     rewardsForA[recipient] = 0;
     require(recipient.call.value(amountToWithdraw)());
 }
@@ -108,11 +108,11 @@ function untrustedGetFirstWithdrawalBonus(address recipient) public {
 
     claimedBonus[recipient] = true;
     rewardsForA[recipient] += 100;
-    untrustedWithdraw(recipient); // claimedBonus has been set to true, so reentry is impossible
+    untrustedWithdrawReward(recipient); // claimedBonus has been set to true, so reentry is impossible
 }
 ```
 
-In addition to the fix making reentry impossible, [untrusted functions have been marked](./recommendations#mark-untrusted-contracts). This same pattern repeats at every level: since `untrustedGetFirstWithdrawalBonus()` calls `untrustedWithdraw()`, which calls an external contract, you must also treat `untrustedGetFirstWithdrawalBonus()` as insecure.
+In addition to the fix making reentry impossible, [untrusted functions have been marked](./recommendations#mark-untrusted-contracts). This same pattern repeats at every level: since `untrustedGetFirstWithdrawalBonus()` calls `untrustedWithdrawReward()`, which calls an external contract, you must also treat `untrustedGetFirstWithdrawalBonus()` as insecure.
 
 Another solution often suggested is a [mutex](https://en.wikipedia.org/wiki/Mutual_exclusion). This allows you to "lock" some state so it can only be changed by the owner of the lock. A simple example might look like this:
 
@@ -151,13 +151,13 @@ contract StateHolder {
     address private lockHolder;
 
     function getLock() {
-        require(lockHolder == 0);
+        require(lockHolder == address(0));
         lockHolder = msg.sender;
     }
 
     function releaseLock() {
         require(msg.sender == lockHolder);
-        lockHolder = 0;
+        lockHolder = address(0);
     }
 
     function set(uint newState) {
@@ -364,3 +364,7 @@ These are attacks which are no longer possible due to changes in the protocol or
 ### Call Depth Attack (deprecated)
 
 As of the [EIP 150](https://github.com/ethereum/EIPs/issues/150) hardfork, call depth attacks are no longer relevant<sup><a href='http://ethereum.stackexchange.com/questions/9398/how-does-eip-150-change-the-call-depth-attack'>\*</a></sup> (all gas would be consumed well before reaching the 1024 call depth limit).
+
+## Other Vulnerabilities
+
+The [Smart Contract Weakness Classification Registry](https://smartcontractsecurity.github.io/SWC-registry/) offers a complete and up-to-date catalogue of known smart contract vulnerabilities and anti-patterns along with real-world examples. Browsing the registry is a good way of keeping up-to-date with the latest attacks.
